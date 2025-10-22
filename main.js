@@ -24,14 +24,8 @@ let dragOffsetY = 0;
 const LENS_SIZE = 128;
 const GRID_COLS = 4;
 const GRID_ROWS = 4;
-let transformingLens = null; // lens currently being transformed
+let transformingLenses = []; // lenses currently being transformed
 let transformStartTime = 0;
-let transformStartRotation = 0;
-let transformTargetRotation = 0;
-let transformStartFlipX = 1;
-let transformTargetFlipX = 1;
-let transformStartFlipY = 1;
-let transformTargetFlipY = 1;
 const TRANSFORM_DURATION = 300; // ms
 let dragDirection = null; // 'horizontal' or 'vertical'
 let dragRowOrCol = -1; // which row or column is being dragged
@@ -41,6 +35,7 @@ let dragAccumulatedY = 0; // accumulated drag distance Y
 let dragStartPositions = []; // store original positions of dragged lenses
 let frozenCursorX = 0; // frozen cursor X position during drag
 let frozenCursorY = 0; // frozen cursor Y position during drag
+let justDragged = false; // track if we just finished a drag to prevent click events
 let isSnapping = false; // is currently snapping to grid
 let snapStartTime = 0; // when snap animation started
 let snapDuration = 200; // snap animation duration in ms
@@ -77,6 +72,151 @@ function resizeCanvas() {
 // Initialize canvas size
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
+
+// Get adjacent lenses based on visual dst position (Lights Out style - no wrapping)
+function getAdjacentLenses(lens) {
+    const adjacent = [lens]; // Include the clicked lens itself
+    
+    // Find the dst grid position of this lens
+    const dstGridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+    const dstGridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+    
+    // Check all 4 orthogonal neighbors based on dst position
+    const neighbors = [
+        { row: dstGridRow - 1, col: dstGridCol }, // up
+        { row: dstGridRow + 1, col: dstGridCol }, // down
+        { row: dstGridRow, col: dstGridCol - 1 }, // left
+        { row: dstGridRow, col: dstGridCol + 1 }  // right
+    ];
+    
+    for (const neighbor of neighbors) {
+        // Check if neighbor is within bounds (no wrapping)
+        if (neighbor.row >= 0 && neighbor.row < GRID_ROWS &&
+            neighbor.col >= 0 && neighbor.col < GRID_COLS) {
+            // Find the lens whose dst is at this grid position
+            const targetX = window.gridStartX + neighbor.col * LENS_SIZE;
+            const targetY = window.gridStartY + neighbor.row * LENS_SIZE;
+            
+            const neighborLens = lenses.find(l => {
+                const lensCol = Math.round((l.dst.x - window.gridStartX) / LENS_SIZE);
+                const lensRow = Math.round((l.dst.y - window.gridStartY) / LENS_SIZE);
+                return lensRow === neighbor.row && lensCol === neighbor.col;
+            });
+            
+            if (neighborLens) {
+                adjacent.push(neighborLens);
+            }
+        }
+    }
+    
+    return adjacent;
+}
+
+// Apply rotation to a lens and its neighbors (without animation)
+function applyRotationImmediate(lens) {
+    const affectedLenses = getAdjacentLenses(lens);
+    for (const l of affectedLenses) {
+        l.rotation = (l.rotation + 90) % 360;
+        l.currentRotation = l.rotation;
+    }
+}
+
+// Apply flip to a lens and its neighbors (without animation)
+function applyFlipImmediate(lens) {
+    const affectedLenses = getAdjacentLenses(lens);
+    for (const l of affectedLenses) {
+        l.flipX = -l.flipX;
+        l.currentFlipX = l.flipX;
+    }
+}
+
+// Apply row slide by one position (without animation)
+function applyRowSlideImmediate(row) {
+    const lensesInRow = lenses.filter(lens => {
+        const gridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+        return gridRow === row;
+    });
+    
+    // Move each lens one position to the right with wrapping
+    for (const lens of lensesInRow) {
+        const currentCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+        const newCol = (currentCol + 1) % GRID_COLS;
+        lens.dst.x = window.gridStartX + newCol * LENS_SIZE;
+    }
+}
+
+// Apply column slide by one position (without animation)
+function applyColumnSlideImmediate(col) {
+    const lensesInCol = lenses.filter(lens => {
+        const gridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+        return gridCol === col;
+    });
+    
+    // Move each lens one position down with wrapping
+    for (const lens of lensesInCol) {
+        const currentRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+        const newRow = (currentRow + 1) % GRID_ROWS;
+        lens.dst.y = window.gridStartY + newRow * LENS_SIZE;
+    }
+}
+
+// Shuffle puzzle by applying random operations from solved state
+function shufflePuzzle() {
+    const actions = [];
+    
+    // Generate slide actions (8-12 operations)
+    const numSlides = 8 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < numSlides; i++) {
+        if (Math.random() < 0.5) {
+            // Random row slide by 1-3 positions
+            const randomRow = Math.floor(Math.random() * GRID_ROWS);
+            const numPositions = 1 + Math.floor(Math.random() * 3);
+            actions.push({ type: 'rowSlide', row: randomRow, count: numPositions });
+        } else {
+            // Random column slide by 1-3 positions
+            const randomCol = Math.floor(Math.random() * GRID_COLS);
+            const numPositions = 1 + Math.floor(Math.random() * 3);
+            actions.push({ type: 'colSlide', col: randomCol, count: numPositions });
+        }
+    }
+    
+    // Generate rotation actions (12-16 clicks)
+    const numRotations = 12 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < numRotations; i++) {
+        const randomLensIndex = Math.floor(Math.random() * lenses.length);
+        actions.push({ type: 'rotate', lensIndex: randomLensIndex });
+    }
+    
+    // Generate flip actions (12-16 clicks)
+    const numFlips = 12 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < numFlips; i++) {
+        const randomLensIndex = Math.floor(Math.random() * lenses.length);
+        actions.push({ type: 'flip', lensIndex: randomLensIndex });
+    }
+    
+    // Fisher-Yates shuffle the actions array
+    for (let i = actions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [actions[i], actions[j]] = [actions[j], actions[i]];
+    }
+    
+    // Execute actions in shuffled order
+    for (const action of actions) {
+        if (action.type === 'rowSlide') {
+            for (let i = 0; i < action.count; i++) {
+                applyRowSlideImmediate(action.row);
+            }
+        } else if (action.type === 'colSlide') {
+            for (let i = 0; i < action.count; i++) {
+                applyColumnSlideImmediate(action.col);
+            }
+        } else if (action.type === 'rotate') {
+            applyRotationImmediate(lenses[action.lensIndex]);
+        } else if (action.type === 'flip') {
+            applyFlipImmediate(lenses[action.lensIndex]);
+        }
+    }
+}
 
 // Create 4x4 grid of lenses
 function createLensGrid() {
@@ -127,16 +267,10 @@ function createLensGrid() {
     // Apply permutation to dst positions
     const dstPositions = permutation.map(i => srcPositions[i]);
     
-    // Create lenses with shuffled dst and store grid positions
+    // Create lenses in SOLVED state (no rotation, no flip)
     for (let i = 0; i < srcPositions.length; i++) {
         const row = Math.floor(i / cols);
         const col = i % cols;
-        
-        // Random rotation: 0, 90, 180, or 270 degrees
-        const randomRotation = [0, 90, 180, 270][Math.floor(Math.random() * 4)];
-        // Random flip: 50% chance for horizontal flip, 50% for vertical flip
-        const randomFlipX = Math.random() < 0.5 ? 1 : -1;
-        const randomFlipY = Math.random() < 0.5 ? 1 : -1;
         
         lenses.push({
             src: {
@@ -151,14 +285,17 @@ function createLensGrid() {
             },
             srcGridRow: row,
             srcGridCol: col,
-            rotation: randomRotation,
-            flipX: randomFlipX,
-            flipY: randomFlipY,
-            currentRotation: randomRotation, // for animation
-            currentFlipX: randomFlipX,
-            currentFlipY: randomFlipY
+            rotation: 0,
+            flipX: 1,
+            flipY: 1,
+            currentRotation: 0,
+            currentFlipX: 1,
+            currentFlipY: 1
         });
     }
+    
+    // Shuffle from solved state to guarantee solvability
+    shufflePuzzle();
     
     draw();
 }
@@ -166,31 +303,51 @@ function createLensGrid() {
 // Initialize lenses
 createLensGrid();
 
-// Rotate lens 90 degrees clockwise
+// Rotate lens and its adjacent neighbors 90 degrees clockwise
 function rotateLens(lens) {
-    transformingLens = lens;
+    const affectedLenses = getAdjacentLenses(lens);
+    
+    // Store start and target states for all affected lenses
+    transformingLenses = affectedLenses.map(l => ({
+        lens: l,
+        startRotation: l.currentRotation,
+        targetRotation: (l.rotation + 90) % 360,
+        startFlipX: l.currentFlipX,
+        targetFlipX: l.flipX,
+        startFlipY: l.currentFlipY,
+        targetFlipY: l.flipY
+    }));
+    
+    // Update target rotation for all affected lenses
+    for (const l of affectedLenses) {
+        l.rotation = (l.rotation + 90) % 360;
+    }
+    
     transformStartTime = performance.now();
-    transformStartRotation = lens.currentRotation;
-    transformTargetRotation = (lens.rotation + 90) % 360;
-    lens.rotation = transformTargetRotation;
-    transformStartFlipX = lens.currentFlipX;
-    transformTargetFlipX = lens.flipX;
-    transformStartFlipY = lens.currentFlipY;
-    transformTargetFlipY = lens.flipY;
     animateTransform();
 }
 
-// Flip lens horizontally
+// Flip lens and its adjacent neighbors horizontally
 function flipLens(lens) {
-    transformingLens = lens;
+    const affectedLenses = getAdjacentLenses(lens);
+    
+    // Store start and target states for all affected lenses
+    transformingLenses = affectedLenses.map(l => ({
+        lens: l,
+        startRotation: l.currentRotation,
+        targetRotation: l.rotation,
+        startFlipX: l.currentFlipX,
+        targetFlipX: -l.currentFlipX,
+        startFlipY: l.currentFlipY,
+        targetFlipY: l.flipY
+    }));
+    
+    // Update target flip for all affected lenses
+    for (const l of affectedLenses) {
+        l.flipX = -l.flipX;
+    }
+    
     transformStartTime = performance.now();
-    transformStartRotation = lens.currentRotation;
-    transformTargetRotation = lens.rotation;
-    transformStartFlipX = lens.currentFlipX;
-    transformTargetFlipX = -lens.flipX;
-    lens.flipX = transformTargetFlipX;
-    transformStartFlipY = lens.currentFlipY;
-    transformTargetFlipY = lens.flipY;
     animateTransform();
 }
 
@@ -200,17 +357,18 @@ function animateTransform() {
     const progress = Math.min(elapsed / TRANSFORM_DURATION, 1);
     const eased = easeOutCubic(progress);
     
-    if (transformingLens) {
+    // Interpolate all transforming lenses
+    for (const transform of transformingLenses) {
         // Interpolate rotation
-        let rotDiff = transformTargetRotation - transformStartRotation;
+        let rotDiff = transform.targetRotation - transform.startRotation;
         // Normalize to shortest rotation path
         if (rotDiff > 180) rotDiff -= 360;
         if (rotDiff < -180) rotDiff += 360;
-        transformingLens.currentRotation = transformStartRotation + rotDiff * eased;
+        transform.lens.currentRotation = transform.startRotation + rotDiff * eased;
         
         // Interpolate flips
-        transformingLens.currentFlipX = transformStartFlipX + (transformTargetFlipX - transformStartFlipX) * eased;
-        transformingLens.currentFlipY = transformStartFlipY + (transformTargetFlipY - transformStartFlipY) * eased;
+        transform.lens.currentFlipX = transform.startFlipX + (transform.targetFlipX - transform.startFlipX) * eased;
+        transform.lens.currentFlipY = transform.startFlipY + (transform.targetFlipY - transform.startFlipY) * eased;
     }
     
     draw();
@@ -218,12 +376,13 @@ function animateTransform() {
     if (progress < 1) {
         requestAnimationFrame(animateTransform);
     } else {
-        if (transformingLens) {
-            transformingLens.currentRotation = transformTargetRotation;
-            transformingLens.currentFlipX = transformTargetFlipX;
-            transformingLens.currentFlipY = transformTargetFlipY;
+        // Set final values
+        for (const transform of transformingLenses) {
+            transform.lens.currentRotation = transform.targetRotation;
+            transform.lens.currentFlipX = transform.targetFlipX;
+            transform.lens.currentFlipY = transform.targetFlipY;
         }
-        transformingLens = null;
+        transformingLenses = [];
         draw();
     }
 }
@@ -339,15 +498,39 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
+// Helper: Find dst that shows the src region at cursor position
+function getDstShowingSrcAtPosition(x, y) {
+    // First, find which src region contains the cursor
+    for (const lens of lenses) {
+        if (x >= lens.src.x && x < lens.src.x + lens.src.size &&
+            y >= lens.src.y && y < lens.src.y + lens.src.size) {
+            // Found the src region, now find which dst is showing this src
+            // The dst that shows this src is the one whose src matches
+            return lens;
+        }
+    }
+    return null;
+}
+
 // Handle mouse down for lens dragging or pointer lock
 canvas.addEventListener('mousedown', (e) => {
     if (isPointerLocked) {
-        // Left click (button 0) = drag, others handled by click/contextmenu
+        const clickX = cursorX;
+        const clickY = cursorY;
+        
+        // Right click (button 2) = flip
+        if (e.button === 2) {
+            const lens = getDstShowingSrcAtPosition(clickX, clickY);
+            if (lens) {
+                flipLens(lens);
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            return;
+        }
+        
+        // Left click (button 0) = drag
         if (e.button === 0) {
-            // Use virtual cursor position when locked
-            const clickX = cursorX;
-            const clickY = cursorY;
-            
             // First check if cursor is inside any src region
             let lensWithCursor = null;
             for (const lens of lenses) {
@@ -402,23 +585,9 @@ canvas.addEventListener('mousedown', (e) => {
     }
 }, true);
 
-// Helper: Find dst that shows the src region at cursor position
-function getDstShowingSrcAtPosition(x, y) {
-    // First, find which src region contains the cursor
-    for (const lens of lenses) {
-        if (x >= lens.src.x && x < lens.src.x + lens.src.size &&
-            y >= lens.src.y && y < lens.src.y + lens.src.size) {
-            // Found the src region, now find which dst is showing this src
-            // The dst that shows this src is the one whose src matches
-            return lens;
-        }
-    }
-    return null;
-}
-
 // Handle click for rotation (left click without drag)
 canvas.addEventListener('click', (e) => {
-    if (isPointerLocked && !dragDirection) {
+    if (isPointerLocked && e.button === 0 && !justDragged) {
         const clickX = cursorX;
         const clickY = cursorY;
         
@@ -429,21 +598,15 @@ canvas.addEventListener('click', (e) => {
             e.preventDefault();
         }
     }
+    
+    // Reset the flag after handling click
+    justDragged = false;
 });
 
-// Handle right click for flip
+// Prevent context menu from appearing
 canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
-    if (isPointerLocked) {
-        const clickX = cursorX;
-        const clickY = cursorY;
-        
-        // Find dst that is showing the src under cursor
-        const lens = getDstShowingSrcAtPosition(clickX, clickY);
-        if (lens) {
-            flipLens(lens);
-        }
-    }
+    return false;
 });
 
 // Handle mouse up to stop dragging and snap to grid
@@ -460,6 +623,9 @@ document.addEventListener('mouseup', () => {
         if (snapTargets && snapTargets.length > 0) {
             startSnapAnimation(snapTargets);
         }
+        
+        // Mark that we just finished dragging to prevent click event
+        justDragged = true;
     }
     
     draggedLens = null;
@@ -830,25 +996,26 @@ function draw() {
         
         // Apply rotation and flip
         ctx.rotate((lens.currentRotation * Math.PI) / 180);
-        ctx.scale(lens.currentFlipX, lens.currentFlipY);
+        ctx.scale(lens.currentFlipX, lens.currentFlipY); // Flip in both directions
         
         // Draw centered
         ctx.drawImage(tempCanvas, -lens.dst.size / 2, -lens.dst.size / 2, lens.dst.size, lens.dst.size);
         
-        ctx.restore();
-        
-        // Draw destination region border on top (inside the region for perfect alignment)
+        // Draw destination region border (inside transformation so it rotates with content)
         const borderWidth = 3;
         ctx.fillStyle = '#00ff00';
+        const halfSize = lens.dst.size / 2;
         
         // Top border
-        ctx.fillRect(x, y, lens.dst.size, borderWidth);
+        ctx.fillRect(-halfSize, -halfSize, lens.dst.size, borderWidth);
         // Bottom border
-        ctx.fillRect(x, y + lens.dst.size - borderWidth, lens.dst.size, borderWidth);
+        ctx.fillRect(-halfSize, halfSize - borderWidth, lens.dst.size, borderWidth);
         // Left border
-        ctx.fillRect(x, y, borderWidth, lens.dst.size);
+        ctx.fillRect(-halfSize, -halfSize, borderWidth, lens.dst.size);
         // Right border
-        ctx.fillRect(x + lens.dst.size - borderWidth, y, borderWidth, lens.dst.size);
+        ctx.fillRect(halfSize - borderWidth, -halfSize, borderWidth, lens.dst.size);
+        
+        ctx.restore();
     };
     
     // Capture and draw lenses with wrapping support
