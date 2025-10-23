@@ -18,29 +18,101 @@ const ANIMATION_DURATION = 300; // ms
 // Lens system
 let lenses = [];
 let draggedLens = null;
-let draggedPart = null; // 'src' or 'dst'
-let dragOffsetX = 0;
-let dragOffsetY = 0;
 const LENS_SIZE = 128;
 const GRID_COLS = 4;
 const GRID_ROWS = 4;
-let transformingLenses = []; // lenses currently being transformed
+const GRID_SPACING = 0;
+const FEATURE_FREEZE_CURSOR_DURING_DRAG = false;
+let transformingLenses = [];
 let transformStartTime = 0;
-const TRANSFORM_DURATION = 300; // ms
-let dragDirection = null; // 'horizontal' or 'vertical'
-let dragRowOrCol = -1; // which row or column is being dragged
+
+const TRANSFORM_DURATION = 300;
+let transformAnimationId = null;
+let dragDirection = null;
+let dragRowOrCol = -1;
 let dragStartPos = { x: 0, y: 0 };
-let dragAccumulatedX = 0; // accumulated drag distance X
-let dragAccumulatedY = 0; // accumulated drag distance Y
-let dragStartPositions = []; // store original positions of dragged lenses
-let frozenCursorX = 0; // frozen cursor X position during drag
-let frozenCursorY = 0; // frozen cursor Y position during drag
-let justDragged = false; // track if we just finished a drag to prevent click events
-let isSnapping = false; // is currently snapping to grid
-let snapStartTime = 0; // when snap animation started
-let snapDuration = 200; // snap animation duration in ms
-let snapStartPositions = []; // positions at start of snap animation
-let snapTargetPositions = []; // target positions for snap animation
+let dragAccumulatedX = 0;
+let dragAccumulatedY = 0;
+let dragStartPositions = [];
+let frozenCursorX = 0;
+let frozenCursorY = 0;
+let justDragged = false;
+let justLocked = false;
+let isSnapping = false;
+let snapStartTime = 0;
+const snapDuration = 200;
+let snapStartPositions = [];
+let snapTargetPositions = [];
+let snapAnimationId = null;
+
+let viewportWidth = window.innerWidth;
+let viewportHeight = window.innerHeight;
+let gridStartX = 0;
+let gridStartY = 0;
+
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+function updateGridLayout() {
+    const cols = GRID_COLS;
+    const rows = GRID_ROWS;
+    const spacing = GRID_SPACING;
+
+    const totalWidth = cols * LENS_SIZE + (cols - 1) * spacing;
+    const totalHeight = rows * LENS_SIZE + (rows - 1) * spacing;
+
+    const newGridStartX = (viewportWidth - totalWidth) / 2;
+    const newGridStartY = (viewportHeight - totalHeight) / 2;
+    const deltaX = newGridStartX - gridStartX;
+    const deltaY = newGridStartY - gridStartY;
+
+    if (lenses.length > 0) {
+        for (const lens of lenses) {
+            lens.src.x += deltaX;
+            lens.src.y += deltaY;
+            lens.dst.x += deltaX;
+            lens.dst.y += deltaY;
+        }
+    }
+
+    for (const entry of dragStartPositions) {
+        entry.x += deltaX;
+        entry.y += deltaY;
+    }
+
+    for (const snap of snapStartPositions) {
+        snap.startX += deltaX;
+        snap.startY += deltaY;
+    }
+
+    for (const target of snapTargetPositions) {
+        target.targetX += deltaX;
+        target.targetY += deltaY;
+        if (target.finalX !== undefined) {
+            target.finalX += deltaX;
+        }
+        if (target.finalY !== undefined) {
+            target.finalY += deltaY;
+        }
+    }
+
+    gridStartX = newGridStartX;
+    gridStartY = newGridStartY;
+}
+
+function updateCursorConstraints() {
+    targetX = clamp(targetX, 0, viewportWidth);
+    targetY = clamp(targetY, 0, viewportHeight);
+    cursorX = clamp(cursorX, 0, viewportWidth);
+    cursorY = clamp(cursorY, 0, viewportHeight);
+
+    if (!isPointerLocked) {
+        const rect = canvas.getBoundingClientRect();
+        mouseX = clamp(mouseX, 0, rect.width);
+        mouseY = clamp(mouseY, 0, rect.height);
+    }
+}
 
 // Set canvas size to match window with correct DPI
 function resizeCanvas() {
@@ -56,16 +128,15 @@ function resizeCanvas() {
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     
-    // Scale context to ensure correct drawing operations
-    ctx.scale(dpr, dpr);
+    // Reset transform then scale context to ensure correct drawing operations
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     
-    // Initialize cursor to center (in CSS pixels)
-    cursorX = width / 2;
-    cursorY = height / 2;
-    targetX = cursorX;
-    targetY = cursorY;
-    
-    // Redraw after resize
+    viewportWidth = width;
+    viewportHeight = height;
+
+    updateGridLayout();
+    updateCursorConstraints();
+
     draw();
 }
 
@@ -78,8 +149,8 @@ function getAdjacentLenses(lens) {
     const adjacent = [lens]; // Include the clicked lens itself
     
     // Find the dst grid position of this lens
-    const dstGridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
-    const dstGridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+    const dstGridCol = Math.round((lens.dst.x - gridStartX) / LENS_SIZE);
+    const dstGridRow = Math.round((lens.dst.y - gridStartY) / LENS_SIZE);
     
     // Check all 4 orthogonal neighbors based on dst position
     const neighbors = [
@@ -94,12 +165,9 @@ function getAdjacentLenses(lens) {
         if (neighbor.row >= 0 && neighbor.row < GRID_ROWS &&
             neighbor.col >= 0 && neighbor.col < GRID_COLS) {
             // Find the lens whose dst is at this grid position
-            const targetX = window.gridStartX + neighbor.col * LENS_SIZE;
-            const targetY = window.gridStartY + neighbor.row * LENS_SIZE;
-            
             const neighborLens = lenses.find(l => {
-                const lensCol = Math.round((l.dst.x - window.gridStartX) / LENS_SIZE);
-                const lensRow = Math.round((l.dst.y - window.gridStartY) / LENS_SIZE);
+                const lensCol = Math.round((l.dst.x - gridStartX) / LENS_SIZE);
+                const lensRow = Math.round((l.dst.y - gridStartY) / LENS_SIZE);
                 return lensRow === neighbor.row && lensCol === neighbor.col;
             });
             
@@ -121,7 +189,7 @@ function applyRotationImmediate(lens) {
     }
 }
 
-// Apply flip to a lens and its neighbors (without animation)
+// Apply horizontal flip to a lens and its neighbors (without animation)
 function applyFlipImmediate(lens) {
     const affectedLenses = getAdjacentLenses(lens);
     for (const l of affectedLenses) {
@@ -133,30 +201,30 @@ function applyFlipImmediate(lens) {
 // Apply row slide by one position (without animation)
 function applyRowSlideImmediate(row) {
     const lensesInRow = lenses.filter(lens => {
-        const gridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+        const gridRow = Math.round((lens.dst.y - gridStartY) / LENS_SIZE);
         return gridRow === row;
     });
     
     // Move each lens one position to the right with wrapping
     for (const lens of lensesInRow) {
-        const currentCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+        const currentCol = Math.round((lens.dst.x - gridStartX) / LENS_SIZE);
         const newCol = (currentCol + 1) % GRID_COLS;
-        lens.dst.x = window.gridStartX + newCol * LENS_SIZE;
+        lens.dst.x = gridStartX + newCol * LENS_SIZE;
     }
 }
 
 // Apply column slide by one position (without animation)
 function applyColumnSlideImmediate(col) {
     const lensesInCol = lenses.filter(lens => {
-        const gridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+        const gridCol = Math.round((lens.dst.x - gridStartX) / LENS_SIZE);
         return gridCol === col;
     });
     
     // Move each lens one position down with wrapping
     for (const lens of lensesInCol) {
-        const currentRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+        const currentRow = Math.round((lens.dst.y - gridStartY) / LENS_SIZE);
         const newRow = (currentRow + 1) % GRID_ROWS;
-        lens.dst.y = window.gridStartY + newRow * LENS_SIZE;
+        lens.dst.y = gridStartY + newRow * LENS_SIZE;
     }
 }
 
@@ -221,28 +289,15 @@ function shufflePuzzle() {
 // Create 4x4 grid of lenses
 function createLensGrid() {
     lenses = [];
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+
     const cols = GRID_COLS;
     const rows = GRID_ROWS;
-    
-    const spacing = 0;
-    const totalWidth = cols * LENS_SIZE + (cols - 1) * spacing;
-    const totalHeight = rows * LENS_SIZE + (rows - 1) * spacing;
-    
-    const startX = (width - totalWidth) / 2;
-    const startY = (height - totalHeight) / 2;
-    
-    // Store grid origin for later calculations
-    window.gridStartX = startX;
-    window.gridStartY = startY;
-    
-    // Create src positions
+    const spacing = GRID_SPACING;
     const srcPositions = [];
     for (let row = 0; row < rows; row++) {
         for (let col = 0; col < cols; col++) {
-            const x = startX + col * (LENS_SIZE + spacing);
-            const y = startY + row * (LENS_SIZE + spacing);
+            const x = gridStartX + col * (LENS_SIZE + spacing);
+            const y = gridStartY + row * (LENS_SIZE + spacing);
             srcPositions.push({ x, y });
         }
     }
@@ -287,10 +342,8 @@ function createLensGrid() {
             srcGridCol: col,
             rotation: 0,
             flipX: 1,
-            flipY: 1,
             currentRotation: 0,
-            currentFlipX: 1,
-            currentFlipY: 1
+            currentFlipX: 1
         });
     }
     
@@ -303,8 +356,11 @@ function createLensGrid() {
 // Initialize lenses
 createLensGrid();
 
-// Rotate lens and its adjacent neighbors 90 degrees clockwise
+// Rotate lens and its adjacent neighbors 90 degrees clockwise (in screen space)
 function rotateLens(lens) {
+    // Cancel any ongoing animation and finalize states
+    finishCurrentAnimation();
+    
     const affectedLenses = getAdjacentLenses(lens);
     
     // Store start and target states for all affected lenses
@@ -313,22 +369,24 @@ function rotateLens(lens) {
         startRotation: l.currentRotation,
         targetRotation: (l.rotation + 90) % 360,
         startFlipX: l.currentFlipX,
-        targetFlipX: l.flipX,
-        startFlipY: l.currentFlipY,
-        targetFlipY: l.flipY
+        targetFlipX: l.currentFlipX  // Keep flip unchanged during rotation
     }));
     
     // Update target rotation for all affected lenses
     for (const l of affectedLenses) {
         l.rotation = (l.rotation + 90) % 360;
+        // flipX stays unchanged
     }
     
     transformStartTime = performance.now();
     animateTransform();
 }
 
-// Flip lens and its adjacent neighbors horizontally
+// Flip lens and its adjacent neighbors horizontally (in screen space)
 function flipLens(lens) {
+    // Cancel any ongoing animation and finalize states
+    finishCurrentAnimation();
+    
     const affectedLenses = getAdjacentLenses(lens);
     
     // Store start and target states for all affected lenses
@@ -337,18 +395,32 @@ function flipLens(lens) {
         startRotation: l.currentRotation,
         targetRotation: l.rotation,
         startFlipX: l.currentFlipX,
-        targetFlipX: -l.currentFlipX,
-        startFlipY: l.currentFlipY,
-        targetFlipY: l.flipY
+        targetFlipX: -l.currentFlipX
     }));
     
-    // Update target flip for all affected lenses
+    // Update target flip for all affected lenses (horizontal only)
     for (const l of affectedLenses) {
         l.flipX = -l.flipX;
     }
     
     transformStartTime = performance.now();
     animateTransform();
+}
+
+// Finish any ongoing transformation animation immediately
+function finishCurrentAnimation() {
+    if (transformAnimationId !== null) {
+        cancelAnimationFrame(transformAnimationId);
+        transformAnimationId = null;
+    }
+    
+    // Set final values for any ongoing animation
+    for (const transform of transformingLenses) {
+        transform.lens.currentRotation = transform.targetRotation;
+        transform.lens.currentFlipX = transform.targetFlipX;
+    }
+    
+    transformingLenses = [];
 }
 
 // Animate transformation
@@ -366,23 +438,22 @@ function animateTransform() {
         if (rotDiff < -180) rotDiff += 360;
         transform.lens.currentRotation = transform.startRotation + rotDiff * eased;
         
-        // Interpolate flips
+        // Interpolate horizontal flip only
         transform.lens.currentFlipX = transform.startFlipX + (transform.targetFlipX - transform.startFlipX) * eased;
-        transform.lens.currentFlipY = transform.startFlipY + (transform.targetFlipY - transform.startFlipY) * eased;
     }
     
     draw();
     
     if (progress < 1) {
-        requestAnimationFrame(animateTransform);
+        transformAnimationId = requestAnimationFrame(animateTransform);
     } else {
         // Set final values
         for (const transform of transformingLenses) {
             transform.lens.currentRotation = transform.targetRotation;
             transform.lens.currentFlipX = transform.targetFlipX;
-            transform.lens.currentFlipY = transform.targetFlipY;
         }
         transformingLenses = [];
+        transformAnimationId = null;
         draw();
     }
 }
@@ -392,6 +463,7 @@ function animateTransform() {
 document.addEventListener('pointerlockchange', () => {
     if (document.pointerLockElement === canvas) {
         isPointerLocked = true;
+        justLocked = true; // Prevent rotation on the initial click that locked
         borderIndicator.classList.add('locked');
         // Animate from current hover position to saved locked position
         targetX = cursorX;
@@ -400,6 +472,7 @@ document.addEventListener('pointerlockchange', () => {
         
     } else {
         isPointerLocked = false;
+        justLocked = false;
         borderIndicator.classList.remove('locked');
         // Animate from locked position to current mouse position
         targetX = mouseX;
@@ -413,8 +486,7 @@ document.addEventListener('mousemove', (e) => {
     if (isPointerLocked) {
         // Handle lens dragging while pointer locked
         if (draggedLens) {
-            // Don't update cursor position while dragging - keep it frozen
-            // Just use movements for drag calculations
+            // When dragging, always use movement deltas for grid logic.
             dragAccumulatedX += e.movementX;
             dragAccumulatedY += e.movementY;
             
@@ -427,23 +499,28 @@ document.addEventListener('mousemove', (e) => {
                     if (dx > dy) {
                         dragDirection = 'horizontal';
                         // Find which row this dst is in
-                        const gridRow = Math.round((draggedLens.dst.y - window.gridStartY) / LENS_SIZE);
+                        const gridRow = Math.round((draggedLens.dst.y - gridStartY) / LENS_SIZE);
                         dragRowOrCol = gridRow;
                         
                         // Store original positions
                         dragStartPositions = lenses
-                            .filter(lens => Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE) === gridRow)
+                            .filter(lens => Math.round((lens.dst.y - gridStartY) / LENS_SIZE) === gridRow)
                             .map(lens => ({ lens, x: lens.dst.x, y: lens.dst.y }));
                     } else {
                         dragDirection = 'vertical';
                         // Find which column this dst is in
-                        const gridCol = Math.round((draggedLens.dst.x - window.gridStartX) / LENS_SIZE);
+                        const gridCol = Math.round((draggedLens.dst.x - gridStartX) / LENS_SIZE);
                         dragRowOrCol = gridCol;
                         
                         // Store original positions
                         dragStartPositions = lenses
-                            .filter(lens => Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE) === gridCol)
+                            .filter(lens => Math.round((lens.dst.x - gridStartX) / LENS_SIZE) === gridCol)
                             .map(lens => ({ lens, x: lens.dst.x, y: lens.dst.y }));
+                    }
+
+                    if (FEATURE_FREEZE_CURSOR_DURING_DRAG) {
+                        frozenCursorX = cursorX;
+                        frozenCursorY = cursorY;
                     }
                 }
             }
@@ -453,6 +530,26 @@ document.addEventListener('mousemove', (e) => {
                 slideRow(dragRowOrCol, dragAccumulatedX);
             } else if (dragDirection === 'vertical') {
                 slideColumn(dragRowOrCol, dragAccumulatedY);
+            }
+
+            if (FEATURE_FREEZE_CURSOR_DURING_DRAG) {
+                targetX = frozenCursorX;
+                targetY = frozenCursorY;
+                cursorX = frozenCursorX;
+                cursorY = frozenCursorY;
+            } else {
+                targetX += e.movementX;
+                targetY += e.movementY;
+
+                const width = window.innerWidth;
+                const height = window.innerHeight;
+                targetX = Math.max(0, Math.min(width, targetX));
+                targetY = Math.max(0, Math.min(height, targetY));
+
+                if (!isAnimating) {
+                    cursorX = targetX;
+                    cursorY = targetY;
+                }
             }
         } else {
             // Normal cursor movement when not dragging
@@ -480,13 +577,10 @@ document.addEventListener('mousemove', (e) => {
         mouseY = e.clientY - rect.top;
         
         // No dragging when not locked - just update cursor
-        if (true) {
-            // If not animating, update cursor immediately
-            if (!isAnimating) {
-                cursorX = mouseX;
-                cursorY = mouseY;
-                draw();
-            }
+        if (!isAnimating) {
+            cursorX = mouseX;
+            cursorY = mouseY;
+            draw();
         }
     }
 });
@@ -544,7 +638,6 @@ canvas.addEventListener('mousedown', (e) => {
             if (lensWithCursor) {
                 // Start dragging - will determine row/col and direction on movement
                 draggedLens = lensWithCursor;
-                draggedPart = 'dst';
                 dragDirection = null;
                 dragRowOrCol = -1;
                 dragStartPos = { x: clickX, y: clickY };
@@ -552,8 +645,10 @@ canvas.addEventListener('mousedown', (e) => {
                 dragAccumulatedY = 0;
                 
                 // Freeze cursor position
-                frozenCursorX = cursorX;
-                frozenCursorY = cursorY;
+                if (FEATURE_FREEZE_CURSOR_DURING_DRAG) {
+                    frozenCursorX = cursorX;
+                    frozenCursorY = cursorY;
+                }
                 
                 e.preventDefault();
                 e.stopPropagation();
@@ -561,8 +656,7 @@ canvas.addEventListener('mousedown', (e) => {
                 // If not in src, check if clicking on a dst directly
                 const result = getLensAtPosition(clickX, clickY);
                 if (result) {
-                    draggedLens = result.lens;
-                    draggedPart = result.part;
+                    draggedLens = result;
                     dragDirection = null;
                     dragRowOrCol = -1;
                     dragStartPos = { x: clickX, y: clickY };
@@ -570,8 +664,10 @@ canvas.addEventListener('mousedown', (e) => {
                     dragAccumulatedY = 0;
                     
                     // Freeze cursor position
-                    frozenCursorX = cursorX;
-                    frozenCursorY = cursorY;
+                    if (FEATURE_FREEZE_CURSOR_DURING_DRAG) {
+                        frozenCursorX = cursorX;
+                        frozenCursorY = cursorY;
+                    }
                     
                     e.preventDefault();
                     e.stopPropagation();
@@ -587,7 +683,7 @@ canvas.addEventListener('mousedown', (e) => {
 
 // Handle click for rotation (left click without drag)
 canvas.addEventListener('click', (e) => {
-    if (isPointerLocked && e.button === 0 && !justDragged) {
+    if (isPointerLocked && e.button === 0 && !justDragged && !justLocked) {
         const clickX = cursorX;
         const clickY = cursorY;
         
@@ -599,8 +695,9 @@ canvas.addEventListener('click', (e) => {
         }
     }
     
-    // Reset the flag after handling click
+    // Reset the flags after handling click
     justDragged = false;
+    justLocked = false;
 });
 
 // Prevent context menu from appearing
@@ -629,7 +726,6 @@ document.addEventListener('mouseup', () => {
     }
     
     draggedLens = null;
-    draggedPart = null;
     dragDirection = null;
     dragRowOrCol = -1;
     dragAccumulatedX = 0;
@@ -696,7 +792,7 @@ function getLensAtPosition(x, y) {
         // Only check dst (src is not draggable)
         if (x >= lens.dst.x && x <= lens.dst.x + lens.dst.size &&
             y >= lens.dst.y && y <= lens.dst.y + lens.dst.size) {
-            return { lens, part: 'dst' };
+            return lens;
         }
     }
     return null;
@@ -704,46 +800,46 @@ function getLensAtPosition(x, y) {
 
 // Slide a row horizontally with wrapping
 function slideRow(row, offset) {
-    dragStartPositions.forEach(({ lens, x, y }) => {
+    dragStartPositions.forEach(({ lens, x }) => {
         // Apply offset to original position
         const newX = x + offset;
         
         // Normalize to grid width for wrapping
-        const relativeX = newX - window.gridStartX;
+        const relativeX = newX - gridStartX;
         const totalWidth = GRID_COLS * LENS_SIZE;
         const wrappedX = ((relativeX % totalWidth) + totalWidth) % totalWidth;
         
-        lens.dst.x = window.gridStartX + wrappedX;
+        lens.dst.x = gridStartX + wrappedX;
     });
 }
 
 // Slide a column vertically with wrapping
 function slideColumn(col, offset) {
-    dragStartPositions.forEach(({ lens, x, y }) => {
+    dragStartPositions.forEach(({ lens, y }) => {
         // Apply offset to original position
         const newY = y + offset;
         
         // Normalize to grid height for wrapping
-        const relativeY = newY - window.gridStartY;
+        const relativeY = newY - gridStartY;
         const totalHeight = GRID_ROWS * LENS_SIZE;
         const wrappedY = ((relativeY % totalHeight) + totalHeight) % totalHeight;
         
-        lens.dst.y = window.gridStartY + wrappedY;
+        lens.dst.y = gridStartY + wrappedY;
     });
 }
 
 // Calculate snap positions for row (considering wrapping)
 function calculateSnapRowPositions(row) {
     const totalGridWidth = GRID_COLS * LENS_SIZE;
-    const lensesInRow = lenses.filter((lens, idx) => {
-        const gridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+    const lensesInRow = lenses.filter(lens => {
+        const gridRow = Math.round((lens.dst.y - gridStartY) / LENS_SIZE);
         return gridRow === row;
     });
     
     return lensesInRow.map(lens => {
-        const gridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+        const gridCol = Math.round((lens.dst.x - gridStartX) / LENS_SIZE);
         const wrappedCol = ((gridCol % GRID_COLS) + GRID_COLS) % GRID_COLS;
-        const targetX = window.gridStartX + wrappedCol * LENS_SIZE;
+        const targetX = gridStartX + wrappedCol * LENS_SIZE;
         
         // Find shortest path considering wrapping
         const currentX = lens.dst.x;
@@ -771,15 +867,15 @@ function calculateSnapRowPositions(row) {
 // Calculate snap positions for column (considering wrapping)
 function calculateSnapColumnPositions(col) {
     const totalGridHeight = GRID_ROWS * LENS_SIZE;
-    const lensesInCol = lenses.filter((lens, idx) => {
-        const gridCol = Math.round((lens.dst.x - window.gridStartX) / LENS_SIZE);
+    const lensesInCol = lenses.filter(lens => {
+        const gridCol = Math.round((lens.dst.x - gridStartX) / LENS_SIZE);
         return gridCol === col;
     });
     
     return lensesInCol.map(lens => {
-        const gridRow = Math.round((lens.dst.y - window.gridStartY) / LENS_SIZE);
+        const gridRow = Math.round((lens.dst.y - gridStartY) / LENS_SIZE);
         const wrappedRow = ((gridRow % GRID_ROWS) + GRID_ROWS) % GRID_ROWS;
-        const targetY = window.gridStartY + wrappedRow * LENS_SIZE;
+        const targetY = gridStartY + wrappedRow * LENS_SIZE;
         
         // Find shortest path considering wrapping
         const currentY = lens.dst.y;
@@ -806,6 +902,11 @@ function calculateSnapColumnPositions(col) {
 
 // Start smooth snap animation
 function startSnapAnimation(targets) {
+    if (snapAnimationId !== null) {
+        cancelAnimationFrame(snapAnimationId);
+        snapAnimationId = null;
+    }
+
     snapStartPositions = targets.map(t => ({
         lens: t.lens,
         startX: t.lens.dst.x,
@@ -814,7 +915,7 @@ function startSnapAnimation(targets) {
     snapTargetPositions = targets;
     snapStartTime = performance.now();
     isSnapping = true;
-    animateSnap();
+    snapAnimationId = requestAnimationFrame(animateSnap);
 }
 
 // Animate snap to grid
@@ -835,7 +936,7 @@ function animateSnap() {
     draw();
     
     if (progress < 1) {
-        requestAnimationFrame(animateSnap);
+        snapAnimationId = requestAnimationFrame(animateSnap);
     } else {
         // Ensure final positions are exact (use finalX/finalY if present for wrapping)
         for (const target of snapTargetPositions) {
@@ -845,6 +946,7 @@ function animateSnap() {
         isSnapping = false;
         snapStartPositions = [];
         snapTargetPositions = [];
+        snapAnimationId = null;
         draw();
     }
 }
@@ -878,7 +980,6 @@ function drawCursorAt(x, y) {
 function draw() {
     const width = window.innerWidth;
     const height = window.innerHeight;
-    const dpr = window.devicePixelRatio || 1;
     
     // Clear canvas
     ctx.fillStyle = '#1a1a1a';
@@ -887,7 +988,7 @@ function draw() {
     // Determine cursor position for rendering
     let renderCursorX = cursorX;
     let renderCursorY = cursorY;
-    if (draggedLens) {
+    if (draggedLens && FEATURE_FREEZE_CURSOR_DURING_DRAG) {
         // When dragging, use frozen cursor position
         renderCursorX = frozenCursorX;
         renderCursorY = frozenCursorY;
@@ -926,95 +1027,77 @@ function draw() {
     
     // Helper function to draw a single lens at a specific position
     const drawLensAt = (lens, x, y, renderCursorX, renderCursorY) => {
-        // Create a high-DPI temporary canvas for the lens content
-        const tempCanvas = document.createElement('canvas');
-        const tempCtx = tempCanvas.getContext('2d');
-        tempCanvas.width = lens.src.size * dpr;
-        tempCanvas.height = lens.src.size * dpr;
-        tempCtx.scale(dpr, dpr);
-        
-        // Fill with background color
-        tempCtx.fillStyle = '#1a1a1a';
-        tempCtx.fillRect(0, 0, lens.src.size, lens.src.size);
-        
         // Check if any part of cursor overlaps with source region
         const cursorSize = 15;
         const cursorLeft = renderCursorX - cursorSize;
         const cursorRight = renderCursorX + cursorSize;
         const cursorTop = renderCursorY - cursorSize;
         const cursorBottom = renderCursorY + cursorSize;
-        
+
         const srcRight = lens.src.x + lens.src.size;
         const srcBottom = lens.src.y + lens.src.size;
-        
-        // Check if cursor bounding box overlaps with source region
-        if (cursorRight >= lens.src.x && cursorLeft < srcRight &&
-            cursorBottom >= lens.src.y && cursorTop < srcBottom) {
-            
-            // Calculate relative position within source
-            const relX = renderCursorX - lens.src.x;
-            const relY = renderCursorY - lens.src.y;
-            
-            // Save context and set clipping to source region bounds
-            tempCtx.save();
-            tempCtx.beginPath();
-            tempCtx.rect(0, 0, lens.src.size, lens.src.size);
-            tempCtx.clip();
-            
-            // Draw cursor on temp canvas (will be clipped to source region)
-            tempCtx.strokeStyle = '#00ff00';
-            tempCtx.lineWidth = 2;
-            
-            // Horizontal line
-            tempCtx.beginPath();
-            tempCtx.moveTo(relX - 15, relY);
-            tempCtx.lineTo(relX + 15, relY);
-            tempCtx.stroke();
-            
-            // Vertical line
-            tempCtx.beginPath();
-            tempCtx.moveTo(relX, relY - 15);
-            tempCtx.lineTo(relX, relY + 15);
-            tempCtx.stroke();
-            
-            // Center circle
-            tempCtx.beginPath();
-            tempCtx.arc(relX, relY, 3, 0, Math.PI * 2);
-            tempCtx.fillStyle = '#00ff00';
-            tempCtx.fill();
-            
-            tempCtx.restore();
-        }
-        
-        // Apply transformation and draw the temp canvas content to destination
+        const cursorOverlapsSrc = cursorRight >= lens.src.x && cursorLeft < srcRight &&
+            cursorBottom >= lens.src.y && cursorTop < srcBottom;
+
+        // Prepare transformation for destination drawing
         ctx.save();
-        
-        // Move to center of destination
+
         const centerX = x + lens.dst.size / 2;
         const centerY = y + lens.dst.size / 2;
         ctx.translate(centerX, centerY);
-        
-        // Apply rotation and flip
-        ctx.rotate((lens.currentRotation * Math.PI) / 180);
-        ctx.scale(lens.currentFlipX, lens.currentFlipY); // Flip in both directions
-        
-        // Draw centered
-        ctx.drawImage(tempCanvas, -lens.dst.size / 2, -lens.dst.size / 2, lens.dst.size, lens.dst.size);
-        
+
+        const flipX = lens.currentFlipX;
+        ctx.scale(flipX, 1);
+        const effectiveRotation = flipX < 0 ? -lens.currentRotation : lens.currentRotation;
+        ctx.rotate((effectiveRotation * Math.PI) / 180);
+
+        const halfSize = lens.dst.size / 2;
+
+        // Clip to lens bounds so rotated contents stay within the square
+        ctx.beginPath();
+        ctx.rect(-halfSize, -halfSize, lens.dst.size, lens.dst.size);
+        ctx.clip();
+
+        // Fill lens background
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(-halfSize, -halfSize, lens.dst.size, lens.dst.size);
+
+        if (cursorOverlapsSrc) {
+            const relX = renderCursorX - lens.src.x;
+            const relY = renderCursorY - lens.src.y;
+            const localX = relX - lens.src.size / 2;
+            const localY = relY - lens.src.size / 2;
+
+            ctx.strokeStyle = '#00ff00';
+            ctx.fillStyle = '#00ff00';
+            ctx.lineWidth = 2;
+
+            // Horizontal line
+            ctx.beginPath();
+            ctx.moveTo(localX - 15, localY);
+            ctx.lineTo(localX + 15, localY);
+            ctx.stroke();
+
+            // Vertical line
+            ctx.beginPath();
+            ctx.moveTo(localX, localY - 15);
+            ctx.lineTo(localX, localY + 15);
+            ctx.stroke();
+
+            // Center circle
+            ctx.beginPath();
+            ctx.arc(localX, localY, 3, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
         // Draw destination region border (inside transformation so it rotates with content)
         const borderWidth = 3;
         ctx.fillStyle = '#00ff00';
-        const halfSize = lens.dst.size / 2;
-        
-        // Top border
         ctx.fillRect(-halfSize, -halfSize, lens.dst.size, borderWidth);
-        // Bottom border
         ctx.fillRect(-halfSize, halfSize - borderWidth, lens.dst.size, borderWidth);
-        // Left border
         ctx.fillRect(-halfSize, -halfSize, borderWidth, lens.dst.size);
-        // Right border
         ctx.fillRect(halfSize - borderWidth, -halfSize, borderWidth, lens.dst.size);
-        
+
         ctx.restore();
     };
     
@@ -1025,15 +1108,15 @@ function draw() {
     // Clip rendering to grid boundaries
     ctx.save();
     ctx.beginPath();
-    ctx.rect(window.gridStartX, window.gridStartY, totalGridWidth, totalGridHeight);
+    ctx.rect(gridStartX, gridStartY, totalGridWidth, totalGridHeight);
     ctx.clip();
     
     for (const lens of lenses) {
         drawLensAt(lens, lens.dst.x, lens.dst.y, renderCursorX, renderCursorY);
         
         // Draw wrapped copies if lens extends beyond grid boundaries
-        const relX = lens.dst.x - window.gridStartX;
-        const relY = lens.dst.y - window.gridStartY;
+        const relX = lens.dst.x - gridStartX;
+        const relY = lens.dst.y - gridStartY;
         
         // Check if wrapping horizontally
         if (relX < 0) {
@@ -1051,12 +1134,14 @@ function draw() {
     }
     
     ctx.restore();
-    
-    // Display coordinates
-    ctx.fillStyle = '#00ff00';
-    ctx.font = '14px monospace';
-    const status = isPointerLocked ? 'LOCKED' : 'HOVER';
-    ctx.fillText(`${status} | X: ${Math.round(cursorX)} Y: ${Math.round(cursorY)}`, 10, 20);
+
+    // Draw full grid border on top of lenses
+    const gridBorderWidth = 4;
+    const gridTotalWidth = GRID_COLS * LENS_SIZE + (GRID_COLS - 1) * GRID_SPACING;
+    const gridTotalHeight = GRID_ROWS * LENS_SIZE + (GRID_ROWS - 1) * GRID_SPACING;
+    ctx.lineWidth = gridBorderWidth;
+    ctx.strokeStyle = '#00ff00';
+    ctx.strokeRect(gridStartX, gridStartY, gridTotalWidth, gridTotalHeight);
 }
 
 // Initial draw
